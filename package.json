@@ -1,0 +1,11 @@
+{
+  "name": "outlive",
+  "version": "1.0.0",
+  "description": "Run a long command detached from the calling process tree, without losing its file access.",
+  "type": "module",
+  "main": "outlive.mjs",
+  "bin": { "outlive": "outlive.mjs" },
+  "scripts": { "test": "node test.mjs" },
+  "license": "MIT",
+  "engines": { "node": ">=18" }
+}
