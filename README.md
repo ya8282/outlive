@@ -1,7 +1,8 @@
 # Outlive
 
-Run a long command detached from the calling process tree, on macOS and Linux,
-without handing it to `launchd` and without losing its file access.
+Run a long command so it outlives the agent that started it, on macOS and
+Linux. It survives the shell tool's 600-second cap, survives the session going
+quiet, keeps its file access, and leaves an exit record on disk either way.
 
 ```
 node outlive.mjs pnpm test:e2e
@@ -23,19 +24,52 @@ It returns immediately. Nothing long-lived stays in your process tree.
 
 ## The problem
 
-A coding agent that runs a long command as a descendant of itself can lose that
-command to any kill aimed at its own process tree. Here, a ~14 minute Playwright
-suite died at roughly the 10 minute mark, every time, in the foreground, in the
-background, and under `nohup` + `disown` alike. The identical command run by
-hand in a terminal completed. The variable was the process tree.
+Two separate things kill a long command that a coding agent launches. Both were
+found the slow way, and the second one is still live.
 
-`nohup` and `disown` do not help. They change signal disposition and job
-control, not membership: a process stays in the tree it was born in.
+**One: the foreground timeout is capped.** The agent's shell tool clamps a
+foreground command to 600 seconds, silently ignoring a larger requested
+timeout. Measured: 800,000 ms requested, killed at exactly 600 s. On an older
+build, hitting that cap did something worse than fail. It moved the run to the
+background and reported *"It's still executing; I'll report the result when it
+finishes."* It was not. It died leaving no output and no record. Current builds
+kill the command honestly instead, but the cap itself is unchanged and still
+documented at 600,000 ms. A command typed into a plain terminal is
+unaffected, since there is no tool in the way.
+
+**Two: an unattended heavy run gets killed anyway.** A full test suite launched
+as a background task, in a session that then goes quiet, dies at around 350
+seconds with no message, no exit code, and no record that it ever ran. Six
+runs, on one build, one day:
+
+| task | session kept taking tool rounds | outcome |
+| --- | --- | --- |
+| trivial blocker | yes | survived 2,457 s |
+| trivial blocker | no | survived 945 s |
+| full suite | yes | 17m 00s, exit 0 |
+| full suite | **no** | **killed at 345 s** |
+| full suite | **no** | **killed at 351 s** |
+| full suite | yes | 16m 20s, exit 0 |
+
+Two kills six seconds apart is a boundary, not noise. It needs both conditions:
+a heavy run *and* a quiet session. Neither alone does it.
+
+Ruled out by measurement: not workload targeting, because a trivial sampler
+running alongside was killed in the same instant; not duration, because a
+trivial task survived 945 s unattended; not memory pressure, with no jetsam
+entries and memory never below 29% free; not idle sleep, because that sampler's
+unbroken timestamps prove the machine was awake.
+
+**The cause is not known.** Attendance correlates across all six runs and that
+is still a correlation, so this README describes the signature and stops there.
+
+`nohup` and `disown` do not help with either. They change signal disposition
+and job control, not membership: a process stays in the tree it was born in.
 
 ## Why not `launchctl submit`
 
 It does move the job out of the tree. On macOS it also moves it into
-**launchd's privacy context**, which:
+launchd's privacy context, which:
 
 - has no access to `~/Documents`, `~/Desktop` or `~/Downloads`,
 - cannot be widened from inside the job, and
@@ -49,21 +83,37 @@ could exec a script from `~` but not the identical script from `~/Documents`.
 Staging the wrapper elsewhere does not help either, because the command still
 has to read the files it was pointed at.
 
-## Why `setsid` does work
+## Why this works
 
-Background, in the order it matters:
+`spawn(..., { detached: true })` reaches libuv, which asks `posix_spawn` for a
+new session on macOS and otherwise forks and calls `setsid` directly:
 
-1. Every Unix process belongs to a **process group**, and every group belongs to a **session**. A shell and everything it launched share a process, and a kill can target a whole group at once. 
-   That's how a single kill sweeps an agent's entire tree.
-1. **`setsid`** is the system call that gives a process a brand-new session and group of its own. Signals aimed at the old group no longer reach it.
-1. When a parent process exits, the OS passes its surviving children to **PID 1**, the first process on the system. "Reparents to PID 1" means the child keeps running under a new parent that the system never kills.
+```c
+/* node/deps/uv/src/unix/process.c */
+if (options->flags & UV_PROCESS_DETACHED)
+  setsid();
+```
 
-Node exposes `setsid` functionality. Specifying the `spawn(..., { detached: true })` option makes the child call `setsid` before your command starts. 
-The child runs in its own session, the launcher exits immediately, and the child ends up parented to PID 1. This is the same escape from the tree that `launchctl` provided.
+That gives the launcher three properties:
 
-The difference is file access. macOS grants access to `~/Documents`, `~/Desktop` and `~/Downloads` per **responsible process**: roughly, processes that identify which app started them.
-When using `launchctl submit`, launchd starts the job, so launchd's permissions apply. However, launchd does not have the same permissions as you running commands in the shell.
-A detached spawn is still started by your own process, so the permission your shell  or agent already has to read the repo carries over unchanged.
+- **The launcher returns in milliseconds**, so no tool call is ever open long
+  enough to reach the 600-second cap. This, rather than the session change, is
+  what defeats problem one.
+- **The child reparents to PID 1**, outside the session that started it, rather
+  than being owned by it.
+- **It writes `started`, `exit` and `finished` to disk.** A run that dies
+  silently still leaves something a later session can read, which matters
+  because both failure modes above erase their own evidence.
+
+It is also still the launcher's own fork, so the process the OS holds
+responsible for file access does not change, which is what `launchctl submit`
+got wrong.
+
+## If you would rather not use this
+
+`run_in_background` is simpler, and it works **as long as the session keeps
+taking tool rounds for the whole run**. Arm a monitor on a short interval and
+stay in the loop. Launch it and go quiet and you are in the table above.
 
 ## Four things that will bite you
 
@@ -72,7 +122,7 @@ If you write your own version:
 - **Write output to files, not pipes.** A pipe nobody reads fills up after about 64KB, and the child then blocks on its next print forever. This is indistinguishable from a hung process.
 - **Call `unref()` on the child.** Otherwise the launcher stays alive waiting for it, and you are back in the process tree you were trying to leave.
 - **Guard against two runs at once**, or they interleave into the same log files. The guard here is a recorded pid plus an "is it still alive" check, so a run that was killed cannot block the next one forever.
-- **Give the caller a file to wait on, not a log to watch.** A quiet log could mean finished or stalled. The `exit` file is written as the command's very last step, so its existence means done and its content is the exit code.
+- **Give the caller a file to wait on, not a log to watch.** A quiet log could mean finished or stalled. The `exit` file is written as the command's very last step, so its existence means done and its content is the exit code. Without it, a run killed by either failure mode above looks the same as one still going.
 
 ## Run directory
 
@@ -80,8 +130,6 @@ The script uses `./.outlive` by default, or `$OUTLIVE_DIR`.
 It holds `run.sh`, `run.log`, `run.err`, `pid`, `started`, `exit`, `finished`, and is recreated per run. Add it to `.gitignore`.
 
 ## Test
-
-Run the following command to test the functionality:
 
 ```
 node test.mjs
@@ -91,6 +139,6 @@ It checks the two properties this exists for (own session, reparents to PID 1) p
 
 ## Is this the only fix?
 
-Probably not. It's the smallest one found after two wrong turns, on one machine, with one agent harness. If you have solved this another way, open an issue and let me know!
+Probably not. It's the smallest one found after two wrong turns, on one machine, with one agent harness. If you have solved this another way, please open an issue.
 
 MIT.

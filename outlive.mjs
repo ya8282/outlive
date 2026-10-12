@@ -1,11 +1,46 @@
 #!/usr/bin/env node
-// outlive -- run a command detached from the calling process tree.
+// outlive -- run a command so it outlives the agent that started it.
 //
-// spawn(..., { detached: true }) = setsid: the child gets its own session and
-// process group, out of reach of any kill aimed at this launcher's tree, and
-// reparents to PID 1 once the launcher exits. Unlike `launchctl submit`, the
-// child is still this process's fork, so macOS keeps the same responsible
-// process for file access and the repo stays readable. Full story: README.md.
+// Two separate things kill a long command launched by a coding agent, and this
+// defeats both. Neither is what it looks like from the inside, which is why
+// this comment is longer than the code.
+//
+// 1. THE FOREGROUND CAP. The agent's shell tool clamps a foreground command to
+//    600 seconds, silently ignoring a larger requested timeout (measured:
+//    800,000 ms requested, killed at exactly 600 s). Older builds responded to
+//    the cap by moving the run to the background and reporting that it was
+//    still executing. It was not; it died writing nothing. Current builds kill
+//    it honestly, but the cap is unchanged.
+//
+// 2. THE UNATTENDED KILL. A heavy run launched as a background task, in a
+//    session that then goes quiet, is killed at around 350 seconds with no
+//    message, no exit code and no record. It needs BOTH conditions: a trivial
+//    task survives unattended, and a heavy run survives while the session keeps
+//    taking tool rounds. Cause unknown -- attendance correlates across six
+//    runs and that is a correlation, so this comment stops there. Ruled out by
+//    measurement: workload targeting (a trivial sampler alongside died in the
+//    same instant), duration, memory pressure, and idle sleep.
+//
+// `nohup` and `disown` help with neither. They change signal disposition and
+// job control, not membership: a process stays in the tree it was born in.
+//
+// `launchctl submit` does move the job out of the tree, and on macOS also into
+// launchd's privacy context, which has no access to ~/Documents, ~/Desktop or
+// ~/Downloads, cannot be widened from inside the job, and has no UI session to
+// show a prompt on. A repo under ~/Documents therefore fails silently: exit
+// 126, a 0-byte log, and a wait loop blocking on an exit file that is never
+// written.
+//
+// So: spawn detached. `spawn(..., { detached: true })` calls setsid, and the
+// three properties that come out of it each defeat something specific --
+// the launcher returns in milliseconds so no tool call nears the cap; the child
+// reparents to PID 1 rather than being owned by the session; and started/exit/
+// finished go to disk, so a run that dies silently still leaves something a
+// later session can read.
+//
+// If you would rather not use this: `run_in_background` is simpler and works
+// as long as the session keeps taking tool rounds for the whole run. Launch it
+// and go quiet and you hit case 2.
 
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, openSync, rmSync } from 'node:fs';
